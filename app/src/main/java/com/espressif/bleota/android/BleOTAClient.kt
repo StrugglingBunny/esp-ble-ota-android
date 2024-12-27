@@ -14,7 +14,8 @@ import java.util.*
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.collections.ArrayList
 import kotlin.concurrent.thread
-
+import java.util.Timer
+import kotlin.concurrent.schedule
 @SuppressLint("MissingPermission")
 class BleOTAClient(
     private val context: Context,
@@ -65,6 +66,8 @@ class BleOTAClient(
     private val packets = LinkedList<ByteArray>()
     private val sectorAckIndex = AtomicInteger(0)
     private val sectorAckMark = ByteArray(0)
+    private var waitForCrcCheck = false
+    private var error_retry_count = 0
 
     fun connect(callback: GattCallback) {
         Log.i(TAG, "start OTA")
@@ -252,24 +255,90 @@ class BleOTAClient(
             postNextPacket()
         }
     }
+    private fun resend_prepare(startSectorIndex: Int = 0) {
+        sectorAckIndex.set(startSectorIndex)
+        packets.clear()
 
+        val sectors = ArrayList<ByteArray>()
+        ByteArrayInputStream(bin).use {
+            val buf = ByteArray(4096)
+            while (true) {
+                val read = it.read(buf)
+                if (read == -1) {
+                    break
+                }
+                val sector = buf.copyOf(read)
+                sectors.add(sector)
+            }
+        }
+        if (DEBUG) {
+            Log.d(TAG, "initPackets: sectors size = ${sectors.size}")
+        }
+
+        // 跳过前 startSectorIndex 个 Sector
+        val filteredSectors = sectors.subList(startSectorIndex, sectors.size)
+
+        val block = ByteArray(packetSize - 3)
+        for (element in filteredSectors.withIndex()) {
+            val sector = element.value
+            val index = element.index + startSectorIndex // 注意补上跳过的偏移
+            val stream = ByteArrayInputStream(sector)
+            var sequence = 0
+            while (true) {
+                val read = stream.read(block)
+                if (read == -1) {
+                    break
+                }
+                var crc = 0
+                val bLast = stream.available() == 0
+                if (bLast) {
+                    sequence = -1
+                    crc = EspCRC16.crc(sector)
+                }
+
+                val len = if (bLast) read + 5 else read + 3
+                val packet = ByteArrayOutputStream(len).use {
+                    it.write(index and 0xff)
+                    it.write(index shr 8 and 0xff)
+                    it.write(sequence)
+                    it.write(block, 0, read)
+                    if (bLast) {
+                        it.write(crc and 0xff)
+                        it.write(crc shr 8 and 0xff)
+                    }
+                    it.toByteArray()
+                }
+
+                ++sequence
+
+                packets.add(packet)
+            }
+            packets.add(sectorAckMark)
+        }
+        if (DEBUG) {
+            Log.d(TAG, "initPackets: packets size = ${packets.size}")
+        }
+    }
     private fun postNextPacket() {
         val packet = packets.pollFirst()
+
         if (packet == null) {
             postCommandEnd()
         } else if (packet === sectorAckMark) {
+            waitForCrcCheck = true ;
             if (DEBUG) {
                 Log.d(TAG, "postNextPacket: wait for sector ACK")
             }
         } else {
             recvFwChar?.value = packet
             gatt?.writeCharacteristic(recvFwChar)
+
         }
     }
 
     private fun parseSectorAck(data: ByteArray) {
         try {
-            val expectIndex = sectorAckIndex.getAndIncrement()
+            val expectIndex = sectorAckIndex.get();
             val ackIndex = (data[0].toInt() and 0xff) or
                     (data[1].toInt() shl 8 and 0xff00)
             if (ackIndex != expectIndex) {
@@ -283,19 +352,52 @@ class BleOTAClient(
             when (ackStatus) {
                 BIN_ACK_SUCCESS -> {
                     postNextPacket()
+                    if(waitForCrcCheck == true)
+                    {
+                        error_retry_count = 0;
+                       sectorAckIndex.getAndIncrement();
+                    }
+
                 }
                 BIN_ACK_CRC_ERROR -> {
-                    callback?.onError(2)
-                    return
-                }
-                BIN_ACK_SECTOR_INDEX_ERROR -> {
+                    error_retry_count++;
+                    if(error_retry_count>3)
+                    {
+                        callback?.onError(2)
+                        return
+                    }
                     val devExpectIndex = (data[4].toInt() and 0xff) or
                             (data[5].toInt() shl 8 and 0xff00)
+                    Log.w(TAG, "parseSectorAck: CRC error, resending sector $ackIndex")
+
+
+                    // 将已发送的包重新加入队列的开头
+                    synchronized(packets) {
+                        Timer().schedule(1000) {
+                            resend_prepare(devExpectIndex);
+                            postNextPacket();
+                        }
+                    }
+                }
+                BIN_ACK_SECTOR_INDEX_ERROR -> {
+                    error_retry_count++;
+                    if(error_retry_count>3)
+                    {
+                        callback?.onError(3)
+                        return
+                    }
+                    val devExpectIndex = (data[4].toInt() and 0xff) or
+                            (data[5].toInt() shl 8 and 0xff00)
+                    synchronized(packets) {
+                        Timer().schedule(200) {
+                            resend_prepare(devExpectIndex);
+                            postNextPacket();
+                        }
+                    }
                     if (DEBUG) {
                         Log.w(TAG, "parseSectorAck: device expect index = $devExpectIndex")
                     }
-                    callback?.onError(3)
-                    return
+
                 }
                 BIN_ACK_PAYLOAD_LENGTH_ERROR -> {
                     callback?.onError(4)
